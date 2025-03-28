@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"database/sql"
 	"encoding/csv"
 	"flag"
@@ -19,167 +20,178 @@ import (
 )
 
 func main() {
-	// Define command line flags
 	dbPath := flag.String("db", "market_data.db", "SQLite database path")
 	backloadFrom := flag.String("backloadFrom", "", "Backload data from this date (YYYY-MM-DD)")
 	backloadTo := flag.String("backloadTo", time.Now().Format("2006-01-02"), "Backload data to this date (YYYY-MM-DD)")
 	flag.Parse()
 
-	// Check if in backload mode
 	if *backloadFrom != "" {
-		// Parse start date for backloading
-		startDate, err := time.Parse("2006-01-02", *backloadFrom)
+		startDate, endDate, err := parseDateRange(*backloadFrom, *backloadTo)
 		if err != nil {
-			slog.Error("Invalid backload start date format", "error", err, "date", *backloadFrom)
+			slog.Error("Invalid date range", "error", err)
 			os.Exit(1)
 		}
 
-		endDate := time.Now()
-		if *backloadTo != "" {
-			endDate, err = time.Parse("2006-01-02", *backloadTo)
-			if err != nil {
-				slog.Error("Invalid backload end date format", "error", err, "date", *backloadTo)
-				os.Exit(1)
-			}
-
-		}
-		if startDate.After(endDate) {
-			slog.Error("Backload start date cannot be in the future", "startDate", *backloadFrom)
-			os.Exit(1)
-		}
-
-		slog.Info("Starting backload operation",
-			"fromDate", startDate.Format("2006-01-02"),
-			"toDate", endDate.Format("2006-01-02"))
-
+		slog.Info("Starting backload", "from", startDate, "to", endDate)
 		backloadData(startDate, endDate, *dbPath)
-
-		slog.Info("Backload operation completed successfully")
+		slog.Info("Backload completed")
 	}
 
-	// Define Pakistan time zone (UTC+5)
-	pakistanLocation, err := time.LoadLocation("Asia/Karachi")
+	pakistanLocation, err := loadPakistanTimeZone()
 	if err != nil {
-		slog.Error("Failed to load timezone for pakistan", "error", err)
+		slog.Error("Failed to load timezone", "error", err)
 		os.Exit(1)
 	}
 
 	for {
-		// Get the current time in Pakistan Time Zone
 		now := time.Now().In(pakistanLocation)
-
-		// Calculate the next 11 PM Pakistan Time
 		nextRun := time.Date(now.Year(), now.Month(), now.Day(), 23, 0, 0, 0, pakistanLocation)
 		if now.After(nextRun) {
-			// If it's already past 11 PM today, schedule for tomorrow
 			nextRun = nextRun.Add(24 * time.Hour)
 		}
 
-		// Calculate the duration to sleep until the next 11 PM
-		sleepDuration := time.Until(nextRun)
-		slog.Info("Scheduling next run", "duration", nextRun)
+		slog.Info("Next scheduled run", "time", nextRun)
+		time.Sleep(time.Until(nextRun))
 
-		time.Sleep(sleepDuration)
-
-		current := time.Now().In(pakistanLocation)
-		// Run the task at 11 PM
-		err = processMarketData(current, *dbPath)
+		err = processMarketData(time.Now().In(pakistanLocation), *dbPath)
 		if err != nil {
-			slog.Error("Failed to process market data", "date", current.Format("2006-01-02"), "error", err)
+			slog.Error("Market data processing failed", "error", err)
 		}
 	}
 }
 
-// backloadData downloads and processes data for a range of dates
-func backloadData(startDate, endDate time.Time, dbPath string) {
-	currentDate := startDate
-	for currentDate.Before(endDate) {
-		slog.Info("Starting backload for", "date", currentDate.Format("2006-01-02"))
+func parseDateRange(from, to string) (time.Time, time.Time, error) {
+	startDate, err := time.Parse("2006-01-02", from)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid start date: %w", err)
+	}
 
-		err := processMarketData(currentDate, dbPath)
+	endDate := time.Now()
+	if to != "" {
+		endDate, err = time.Parse("2006-01-02", to)
 		if err != nil {
-			slog.Error("Failed to backload data", "date", currentDate.Format("2006-01-02"))
-		} else {
-			slog.Info("Successfully backloaded date", "date", currentDate.Format("2006-01-02"))
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid end date: %w", err)
 		}
+	}
 
-		currentDate = currentDate.AddDate(0, 0, 1)
+	if startDate.After(endDate) {
+		return time.Time{}, time.Time{}, fmt.Errorf("start date is after end date")
+	}
+
+	return startDate, endDate, nil
+}
+
+func loadPakistanTimeZone() (*time.Location, error) {
+	return time.LoadLocation("Asia/Karachi")
+}
+
+func backloadData(startDate, endDate time.Time, dbPath string) {
+	for currentDate := startDate; !currentDate.After(endDate); currentDate = currentDate.AddDate(0, 0, 1) {
+		slog.Info("Backloading", "date", currentDate.Format("2006-01-02"))
+
+		if err := processMarketData(currentDate, dbPath); err != nil {
+			slog.Error("Backload failed", "date", currentDate, "error", err)
+		} else {
+			slog.Info("Backload successful", "date", currentDate)
+		}
 	}
 }
 
 func processMarketData(date time.Time, dbPath string) error {
-	slog.Info("Processing market data", "date", date.Format("2006-01-02"), "db", dbPath)
-	// 1. Download the zip file
-	url := fmt.Sprintf("https://dps.psx.com.pk/download/mkt_summary/%s.Z", date.Format("2006-01-02"))
-	slog.Info("Downloading market data", "url", url)
+	slog.Info("Processing market data", "date", date.Format("2006-01-02"))
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
+	data, fileName, err := downloadAndExtractMarketData(date)
+	if err != nil {
+		return fmt.Errorf("data extraction failed: %w", err)
 	}
 
+	db, err := openDatabase(dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if err := createTable(db); err != nil {
+		return err
+	}
+
+	return insertMarketData(db, data, fileName, date)
+}
+
+func downloadAndExtractMarketData(date time.Time) ([]byte, string, error) {
+	url := fmt.Sprintf("https://dps.psx.com.pk/download/mkt_summary/%s.Z", date.Format("2006-01-02"))
+	slog.Info("Downloading", "url", url)
+
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		return fmt.Errorf("failed to download file: %w", err)
+		return nil, "", fmt.Errorf("download failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed with status: %s", resp.Status)
+		return nil, "", fmt.Errorf("unexpected status: %s", resp.Status)
 	}
-	// Read response body
+
 	zipData, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
+		return nil, "", fmt.Errorf("failed reading response: %w", err)
 	}
 
-	slog.Info("Downloaded zip file", "size", len(zipData), "date", date.Format("2006-01-02"))
-
-	// 2. Extract the zip file
+	// First try to process as ZIP
 	zipReader, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
-	if err != nil {
-		return fmt.Errorf("failed to parse zip file: %w", err)
+	if err == nil {
+		// Successfully opened as ZIP, process files
+		for _, file := range zipReader.File {
+			f, err := file.Open()
+			if err != nil {
+				return nil, "", fmt.Errorf("failed opening zip file: %w", err)
+			}
+			defer f.Close()
+
+			fileData, err := io.ReadAll(f)
+			if err != nil {
+				return nil, "", fmt.Errorf("failed reading zip file: %w", err)
+			}
+
+			return fileData, file.Name, nil
+		}
+		return nil, "", fmt.Errorf("no files found in zip")
 	}
 
-	// Find the file in the archive
-	var fileData []byte
-	var fileName string
-	for _, file := range zipReader.File {
-		fileName = file.Name
-		slog.Info("Processing file from archive", "filename", fileName, "date", date.Format("2006-01-02"))
+	// If not ZIP, try as GZIP
+	gzipReader, err := gzip.NewReader(bytes.NewReader(zipData))
+	if err == nil {
+		defer gzipReader.Close()
 
-		f, err := file.Open()
+		fileData, err := io.ReadAll(gzipReader)
 		if err != nil {
-			return fmt.Errorf("failed to open file within zip: %w", err)
+			return nil, "", fmt.Errorf("failed reading gzip file: %w", err)
 		}
 
-		fileData, err = io.ReadAll(f)
-		f.Close()
-		if err != nil {
-			return fmt.Errorf("failed to read file within zip: %w", err)
+		// Use the original filename if available, otherwise generate one
+		filename := gzipReader.Name
+		if filename == "" {
+			filename = fmt.Sprintf("%s_decompressed", date.Format("2006-01-02"))
 		}
 
-		// We only process the first file
-		break
+		return fileData, filename, nil
 	}
 
-	if fileData == nil {
-		return fmt.Errorf("no files found in the archive")
-	}
+	// If neither worked, return an error
+	return nil, "", fmt.Errorf("file is neither valid ZIP nor GZIP format")
+}
 
-	// 3. Parse the data using CSV parser
-	reader := csv.NewReader(bytes.NewReader(fileData))
-	reader.Comma = '|'          // Set delimiter to pipe
-	reader.FieldsPerRecord = -1 // Allow variable number of fields
-
-	// 4. Create or open the SQLite database
+func openDatabase(dbPath string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		return fmt.Errorf("failed to open database: %w", err)
+		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
-	defer db.Close()
+	return db, nil
+}
 
-	// 5. Create table if it doesn't exist
-	createTableSQL := `
+func createTable(db *sql.DB) error {
+	query := `
 	CREATE TABLE IF NOT EXISTS market_data (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		date TEXT,
@@ -194,120 +206,69 @@ func processMarketData(date time.Time, dbPath string) error {
 		previous_close REAL,
 		UNIQUE(date, symbol)
 	);`
-
-	_, err = db.Exec(createTableSQL)
+	_, err := db.Exec(query)
 	if err != nil {
-		return fmt.Errorf("failed to create table: %w", err)
+		return fmt.Errorf("failed creating table: %w", err)
 	}
+	return nil
+}
 
-	// 6. Insert data into the database
-	slog.Info("Inserting data into database", "date", date.Format("2006-01-02"))
+func insertMarketData(db *sql.DB, fileData []byte, fileName string, date time.Time) error {
+	reader := csv.NewReader(bytes.NewReader(fileData))
+	reader.Comma = '|'
+	reader.FieldsPerRecord = -1
+
 	tx, err := db.Begin()
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return fmt.Errorf("transaction start failed: %w", err)
 	}
+	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-	INSERT OR REPLACE INTO market_data
-	(date, symbol, code, company_name, open, high, low, close, volume, previous_close)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`)
+		INSERT OR REPLACE INTO market_data
+		(date, symbol, code, company_name, open, high, low, close, volume, previous_close)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to prepare insert statement: %w", err)
+		return fmt.Errorf("statement preparation failed: %w", err)
 	}
 	defer stmt.Close()
 
-	recordCount := 0
-	errorCount := 0
-
-	// Read and process all records
+	var recordCount, errorCount int
 	for {
 		record, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
+		if err != nil || len(record) < 10 {
+			errorCount++
+			continue
+		}
+
+		_, err = stmt.Exec(date.Format("2006-01-02"), strings.TrimSpace(record[1]), strings.TrimSpace(record[2]),
+			strings.TrimSpace(record[3]), parseFloat(record[4]), parseFloat(record[5]),
+			parseFloat(record[6]), parseFloat(record[7]), parseInt(record[8]), parseFloat(record[9]))
+
 		if err != nil {
-			slog.Warn("Error reading CSV record", "error", err, "date", date.Format("2006-01-02"))
 			errorCount++
 			continue
 		}
-
-		// Skip empty lines
-		if len(record) == 0 {
-			continue
-		}
-
-		// Ensure we have enough fields
-		if len(record) < 10 {
-			slog.Debug("Skipping record with insufficient fields", "record", record, "fieldCount", len(record))
-			errorCount++
-			continue
-		}
-
-		// Extract fields
-		recordDate := strings.TrimSpace(record[0])
-
-		recordParsedDate, err := time.Parse("02Jan2006", recordDate)
-		if err != nil {
-			slog.Error("Failed to parse record date", "error", err, "record", record)
-			errorCount++
-			continue
-		}
-
-		recordDate = recordParsedDate.Format("2006-01-02")
-
-		symbol := strings.TrimSpace(record[1])
-		code := strings.TrimSpace(record[2])
-		companyName := strings.TrimSpace(record[3])
-
-		// Parse numeric values
-		open, _ := parseNumeric(record[4])
-		high, _ := parseNumeric(record[5])
-		low, _ := parseNumeric(record[6])
-		close, _ := parseNumeric(record[7])
-		volume, _ := parseInt(record[8])
-		previousClose, _ := parseNumeric(record[9])
-
-		// Insert record
-		_, err = stmt.Exec(recordDate, symbol, code, companyName, open, high, low, close, volume, previousClose)
-		if err != nil {
-			slog.Error("Failed to insert record", "error", err, "symbol", symbol, "date", date.Format("2006-01-02"))
-			errorCount++
-			continue
-		}
-
 		recordCount++
 	}
 
 	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
+		return fmt.Errorf("transaction commit failed: %w", err)
 	}
 
-	slog.Info("Database operation completed",
-		"date", date.Format("2006-01-02"),
-		"recordsInserted", recordCount,
-		"errorCount", errorCount,
-		"filename", fileName)
-
-	slog.Info("Successfully processed market data", "date", date.Format("2006-01-02"))
+	slog.Info("Data inserted", "records", recordCount, "errors", errorCount, "file", fileName)
 	return nil
 }
 
-// Helper function to parse numeric values that handles both float and int
-func parseNumeric(s string) (float64, error) {
-	s = strings.TrimSpace(s)
-	if s == "" || s == "0" || s == "0.0" {
-		return 0.0, nil
-	}
-	return strconv.ParseFloat(s, 64)
+func parseFloat(s string) float64 {
+	v, _ := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	return v
 }
 
-// Helper function specifically for parsing integers
-func parseInt(s string) (int, error) {
-	s = strings.TrimSpace(s)
-	if s == "" || s == "0" {
-		return 0, nil
-	}
-	return strconv.Atoi(s)
+func parseInt(s string) int {
+	v, _ := strconv.Atoi(strings.TrimSpace(s))
+	return v
 }
